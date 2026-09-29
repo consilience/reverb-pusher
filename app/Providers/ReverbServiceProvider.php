@@ -145,6 +145,15 @@ class ReverbServiceProvider extends ServiceProvider
                 break;
             }
 
+            // Make the next attempt open a new database connection. An
+            // attempt that connected but found no active apps leaves its
+            // handle cached. If the database then goes away with an error
+            // that Laravel does not recognise as a lost connection, every
+            // later attempt would reuse that dead handle and could use up the
+            // whole window without trying a new one. If no connection was
+            // ever made, the next attempt opens a new one either way.
+            $activeApps->disconnect();
+
             $delay = min($nextDelay, $remaining);
 
             Log::warning('Reverb: Could not load apps from database, retrying', [

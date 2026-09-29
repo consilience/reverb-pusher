@@ -49,16 +49,23 @@ function pretendToBeTheReverbServer(): void
 }
 
 /**
- * Stand in for the database being unreachable: the first $failures reads
- * throw the kind of error a refused connection produces, and any later read
- * runs the real query. $secondsPerFailure moves the clock on for each failed
- * read, to mimic a connection attempt that takes a while to time out.
+ * Stand in for the database read. The first $failures reads throw the kind
+ * of error a refused connection produces, and any later read runs the real
+ * query. $secondsPerFailure moves the clock on for each failed read, to mimic
+ * a connection attempt that takes a while to time out.
+ *
+ * Every read and every disconnect is recorded in order. disconnect() only
+ * records: the test database lives in memory, so really disconnecting would
+ * throw its tables away.
  */
-function databaseFailsFor(int $failures, int $secondsPerFailure = 0): ActiveReverbApps
+function standInDatabase(int $failures = 0, int $secondsPerFailure = 0): ActiveReverbApps
 {
     $source = new class($failures, $secondsPerFailure) extends ActiveReverbApps
     {
         public int $attempts = 0;
+
+        /** @var list<string> */
+        public array $events = [];
 
         public function __construct(
             private int $failures,
@@ -68,6 +75,7 @@ function databaseFailsFor(int $failures, int $secondsPerFailure = 0): ActiveReve
         public function fetch(): Collection
         {
             $this->attempts++;
+            $this->events[] = 'fetch';
 
             if ($this->attempts <= $this->failures) {
                 Carbon::setTestNow(Carbon::now()->addSeconds($this->secondsPerFailure));
@@ -76,6 +84,11 @@ function databaseFailsFor(int $failures, int $secondsPerFailure = 0): ActiveReve
             }
 
             return parent::fetch();
+        }
+
+        public function disconnect(): void
+        {
+            $this->events[] = 'disconnect';
         }
     };
 
@@ -101,6 +114,7 @@ beforeEach(function () {
     Sleep::fake();
     $this->freezeTime();
     Log::spy();
+    $this->database = standInDatabase();
 
     $this->totalSecondsSlept = 0;
     Sleep::whenFakingSleep(function (CarbonInterval $duration) {
@@ -144,7 +158,7 @@ describe('inside the reverb:start process', function () {
 
     it('keeps retrying while the database is unreachable and carries on once it answers', function () {
         ReverbApp::factory()->create(['app_id' => 'app-live']);
-        $database = databaseFailsFor(2);
+        $database = standInDatabase(2);
         pretendToBeTheReverbServer();
 
         bootReverbProviderAgain();
@@ -158,7 +172,7 @@ describe('inside the reverb:start process', function () {
 
     it('gives up with an error once the retry window has passed if the database never answers', function () {
         ReverbApp::factory()->create();
-        $database = databaseFailsFor(PHP_INT_MAX);
+        $database = standInDatabase(PHP_INT_MAX);
         pretendToBeTheReverbServer();
 
         expect(fn () => bootReverbProviderAgain())
@@ -207,7 +221,7 @@ describe('inside the reverb:start process', function () {
             'reverb.startup.retry_window' => 10,
             'reverb.startup.max_retry_delay' => 3,
         ]);
-        $database = databaseFailsFor(PHP_INT_MAX);
+        $database = standInDatabase(PHP_INT_MAX);
         pretendToBeTheReverbServer();
 
         expect(fn () => bootReverbProviderAgain())->toThrow(RuntimeException::class);
@@ -218,7 +232,7 @@ describe('inside the reverb:start process', function () {
 
     it('counts slow connection attempts towards the retry window', function () {
         Sleep::syncWithCarbon();
-        $database = databaseFailsFor(PHP_INT_MAX, secondsPerFailure: 30);
+        $database = standInDatabase(PHP_INT_MAX, secondsPerFailure: 30);
         pretendToBeTheReverbServer();
 
         expect(fn () => bootReverbProviderAgain())->toThrow(RuntimeException::class);
@@ -226,6 +240,29 @@ describe('inside the reverb:start process', function () {
         // Attempts end at 30s, 61s, 93s and 127s; the fourth is past 120s.
         Sleep::assertSequence(sleepsOf([1, 2, 4]));
         expect($database->attempts)->toBe(4);
+    });
+
+    it('drops the database connection after a failed read, before waiting to retry', function () {
+        ReverbApp::factory()->create();
+        $database = standInDatabase(1);
+        Sleep::whenFakingSleep(fn () => $database->events[] = 'sleep');
+        pretendToBeTheReverbServer();
+
+        bootReverbProviderAgain();
+
+        expect($database->events)->toBe(['fetch', 'disconnect', 'sleep', 'fetch']);
+    });
+
+    it('drops the database connection after finding no active apps, before waiting to retry', function () {
+        pretendToBeTheReverbServer();
+        Sleep::whenFakingSleep(function () {
+            $this->database->events[] = 'sleep';
+            ReverbApp::factory()->create();
+        });
+
+        bootReverbProviderAgain();
+
+        expect($this->database->events)->toBe(['fetch', 'disconnect', 'sleep', 'fetch']);
     });
 });
 
@@ -238,13 +275,13 @@ describe('outside the reverb:start process', function () {
     ]);
 
     it('warns and carries on without waiting when the database is unreachable', function (?array $argv, bool $runningInConsole) {
-        $database = databaseFailsFor(PHP_INT_MAX);
+        $database = standInDatabase(PHP_INT_MAX);
         pretendProcessIs($argv, $runningInConsole);
 
         bootReverbProviderAgain();
 
         Sleep::assertNeverSlept();
-        expect($database->attempts)->toBe(1)
+        expect($database->events)->toBe(['fetch'])
             ->and(config('reverb.apps.apps'))->toBe([]);
         Log::shouldHaveReceived('warning')
             ->once()
@@ -260,8 +297,37 @@ describe('outside the reverb:start process', function () {
         bootReverbProviderAgain();
 
         Sleep::assertNeverSlept();
-        expect(array_column(config('reverb.apps.apps'), 'app_id'))->toBe([LoopbackApp::appId()]);
+        expect($this->database->events)->toBe(['fetch'])
+            ->and(array_column(config('reverb.apps.apps'), 'app_id'))->toBe([LoopbackApp::appId()]);
         Log::shouldNotHaveReceived('warning');
         Log::shouldNotHaveReceived('error');
     })->with('other processes');
+});
+
+describe('the database read', function () {
+    it('drops the cached handle of the connection it reads from when told to disconnect', function () {
+        // Point the app model at a connection of its own. Disconnecting the
+        // test database's connection would abandon the transaction that
+        // RefreshDatabase wraps each test in, and later tests would then
+        // fail to start their own.
+        $testConnection = config('database.default');
+        config([
+            'database.connections.disconnect-probe' => ['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => ''],
+            'database.default' => 'disconnect-probe',
+        ]);
+
+        try {
+            $connection = (new ReverbApp)->getConnection();
+            $connection->getPdo();
+
+            expect($connection->getName())->toBe('disconnect-probe')
+                ->and($connection->getRawPdo())->toBeInstanceOf(PDO::class);
+
+            (new ActiveReverbApps)->disconnect();
+
+            expect($connection->getRawPdo())->toBeNull();
+        } finally {
+            config(['database.default' => $testConnection]);
+        }
+    });
 });
